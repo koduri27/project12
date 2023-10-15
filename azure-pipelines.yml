@@ -1,0 +1,165 @@
+
+trigger:
+- none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+  subscription : 'project10serviceconnection'  #replace with your service connection name
+  SQLserver: 'sqlserverproject10.database.windows.net'
+  DatabaseName: 'sqldbproject10'
+  SQLuser: 'sqladmin'
+  SQLpassword: 'Brillio-1982'
+  ACR: 'acrproject10.azurecr.io'
+
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:  
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: replacetokens@5
+      displayName: 'Replace tokens in appsettings.json'
+      inputs:
+        rootDirectory: '$(build.sourcesdirectory)/src/MyHealth.Web'
+        targetFiles: appsettings.json
+        tokenPattern: rm
+        escapeType: none
+
+    - task: replacetokens@5
+      displayName: 'Replace tokens in mhc-aks.yaml'
+      inputs:
+        rootDirectory: '$(build.sourcesdirectory)'
+        targetFiles: 'mhc-aks.yaml'
+        tokenPattern: rm
+        escapeType: none
+
+    - task: DockerCompose@0
+      displayName: 'Run services'
+      inputs:
+        azureSubscription: $(subscription)
+        azureContainerRegistry: '{"loginServer":"acrproject10.azurecr.io", "id" : "/subscriptions/592c213c-2bb4-4718-a15e-6ade98087128/resourceGroups/project10rg/providers/Microsoft.ContainerRegistry/registries/acrproject10"}'
+        dockerComposeFile: 'docker-compose.ci.build.yml'
+        action: 'Run services'
+        detached: false
+
+    - task: DockerCompose@0
+      displayName: 'Build services'
+      inputs:
+        azureSubscription: $(subscription)
+        azureContainerRegistry: '{"loginServer":"acrproject10.azurecr.io", "id" : "/subscriptions/592c213c-2bb4-4718-a15e-6ade98087128/resourceGroups/project10rg/providers/Microsoft.ContainerRegistry/registries/acrproject10"}'
+        dockerComposeFile: 'docker-compose.yml'
+        dockerComposeFileArgs: 'DOCKER_BUILD_SOURCE='
+        action: 'Build services'
+        additionalImageTags: '$(Build.BuildId)'
+
+    - task: DockerCompose@0
+      displayName: 'Push services'
+      inputs:
+        azureSubscription: $(subscription)
+        azureContainerRegistry: '{"loginServer":"acrproject10.azurecr.io", "id" : "/subscriptions/592c213c-2bb4-4718-a15e-6ade98087128/resourceGroups/project10rg/providers/Microsoft.ContainerRegistry/registries/acrproject10"}'
+        dockerComposeFile: 'docker-compose.yml'
+        dockerComposeFileArgs: 'DOCKER_BUILD_SOURCE='
+        action: 'Push services'
+        additionalImageTags: '$(Build.BuildId)'
+
+    - task: DockerCompose@0
+      displayName: 'Lock services'
+      inputs:
+        azureSubscription: $(subscription)
+        azureContainerRegistry: '{"loginServer":"acrproject10.azurecr.io", "id" : "/subscriptions/592c213c-2bb4-4718-a15e-6ade98087128/resourceGroups/project10rg/providers/Microsoft.ContainerRegistry/registries/acrproject10"}'
+        dockerComposeFile: 'docker-compose.yml'
+        dockerComposeFileArgs: 'DOCKER_BUILD_SOURCE='
+        action: 'Lock services'
+
+    - task: CopyFiles@2
+      displayName: 'Copy Files'
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        Contents: |
+          **/mhc-aks.yaml
+          **/*.dacpac
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      inputs:
+        ArtifactName: deploy
+
+- stage: Dev
+  displayName: Dev stage
+  dependsOn: Build
+  condition: succeeded('Build')
+  jobs:
+  - deployment: DB 
+    displayName: 'DB Deployment'
+    environment: 'development'
+    pool: 
+      vmImage: 'windows-2019'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Execute Azure SQL : DacpacTask'
+            inputs:
+              azureSubscription: $(subscription)
+              AuthenticationType: 'server'
+              ServerName: '$(SQLserver)'
+              DatabaseName: '$(DatabaseName)'
+              SqlUsername: '$(SQLuser)'
+              SqlPassword: '$(SQLpassword)'
+              deployType: 'DacpacTask'
+              DeploymentAction: 'Publish'
+              DacpacFile: '$(Agent.BuildDirectory)/**/*.dacpac'
+              IpDetectionMethod: 'IPAddressRange'
+              StartIpAddress: '0.0.0.0'
+              EndIpAddress: '255.255.255.255'
+
+  - deployment: AKS
+    displayName: 'AKS Deployment'
+    environment: 'development'
+    pool: 
+      vmImage: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Kubernetes@1
+            displayName: 'Create Deployments & Services in AKS'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(subscription)
+              azureResourceGroup: 'project10rg'
+              kubernetesCluster: 'kubproject10'
+              command: 'apply'
+              useConfigurationFile: true
+              configuration: '$(Agent.BuildDirectory)/deploy/mhc-aks.yaml'
+              secretType: 'dockerRegistry'
+              containerRegistryType: 'Azure Container Registry'
+              azureSubscriptionEndpointForSecrets: $(subscription)
+              azureContainerRegistry: '$(ACR)'
+              secretName: 'mysecretkey'
+              versionSpec: '1.8.1'
+              checkLatest: true
+          
+          - task: Kubernetes@1
+            displayName: 'Update image in AKS'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(subscription)
+              azureResourceGroup: project10rg
+              kubernetesCluster: kubproject10
+              command: set
+              arguments: 'image deployments/mhc-front mhc-front=$(ACR)/myhealth.web:latest'
+              azureSubscriptionEndpointForSecrets: $(subscription)
+              azureContainerRegistry: '$(ACR)'
+              secretName: mysecretkey
+              versionSpec: 1.8.1
+              checkLatest: true
